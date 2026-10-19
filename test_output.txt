@@ -1,0 +1,5 @@
+pipe_summary pipe_id=171 creator_pid=1864 creator_comm="python3" creator_exe="/usr/bin/python3.14" creator_cmdline="python3 -c import os; r,w=os.pipe(); os.close(r); os.close(w)" parent_pid=1863 parent_comm="bash" parent_exe="/usr/bin/bash" parent_cmdline="bash -c python3 -c 'import os; r,w=os.pipe(); os.close(r); os.close(w)' && bash -c 'printf x | cat >/dev/null'" connections=0
+pipe_summary pipe_id=172 creator_pid=1863 creator_comm="bash" creator_exe="/usr/bin/bash" creator_cmdline="bash -c printf x | cat >/dev/null" parent_pid=1861 parent_comm="sshd-session" parent_exe="/usr/lib/openssh/sshd-session" parent_cmdline="sshd-session: ebpf-test@notty" connections=2
+pipe_connection pipe_id=172 side=reader pid=1866 comm="cat" exe="/usr/bin/cat" cmdline="cat"
+pipe_connection pipe_id=172 side=writer pid=1865 comm="bash" exe="/usr/bin/bash" cmdline="bash -c printf x | cat >/dev/null"
+pipe_summary pipe_id=173 creator_pid=1866 creator_comm="cat" creator_exe="/usr/bin/cat" creator_cmdline="cat" parent_pid=1863 parent_comm="bash" parent_exe="/usr/bin/bash" parent_cmdline="bash -c printf x | cat >/dev/null" connections=0
