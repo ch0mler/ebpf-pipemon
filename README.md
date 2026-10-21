@@ -3,6 +3,74 @@
 Pipe Monitor is an eBPF-based Linux tool for identifying anonymous pipes (`|`)
 and the processes with pipe ends connected to their standard input or output.
 
+## Learning Process
+
+Since this helper has been 100% vibe coded so far, I'm still understanding some of the initial design choices that Copilot has made. This section attempts to document my thought process while learning different pieces. 
+
+### Additional hooks
+
+I initially thought only `pipe()` would be appropriate to monitor, but `pipe2()`, `CLONE_FILES`, and `close_range()` were also chosen for inspection. Under what scenarios are each of these techniques used in setting up pipes, and why would each technique be used over each other?
+
+#### pipe
+
+Function Signature ([Source](www.man7.org/linux/man-pages/man2/pipe.2.html))
+```
+int pipe(int pipefd[2])
+```
+
+Quick Description
+
+```
+creates a pipe, a unidirectional data channel that can be
+       used for interprocess communication.
+```
+
+Returns a read-end fd and a write-end fd for 2 processes to comunicate.
+As opposed to named pipes (FIFO objects), these objects don't have a filesystem path even though file descriptors are created to interact with them too.
+
+#### pipe2
+
+Function Signature ([Source](www.man7.org/linux/man-pages/man2/pipe.2.html))
+```
+int pipe2(int pipefd[2], int flags)
+```
+
+It sounds like this is extremely similar to `pipe()` but with the addition of some flags. Based on the pipe manual page:
+
+```
+If flags is 0, then pipe2() is the same as pipe().
+  ...
+* O_CLOEXEC: close-on-exec flag w/ same behavior as open() call
+* O_DIRECT: (3.4+) read/write data in pipe as packets instead of raw bitstreams
+* O_NONBLOCK: opened in non-blocking mode, so no waiting for reads/writes
+* O_NOTIFICATION_PIPE: (5.8+) kernel notifications added to pipes
+```
+
+#### CLONE_FILES
+
+#### close_range()
+
+## Open Questions
+
+**Q**: If pipes aren't on the filesystem, where are they?
+
+**A**: Based on [this Oracle post](https://blogs.oracle.com/linux/pipe-and-splice), it looks like pipes are basically a linked list of memory pages where head points to the location of the next write, and the tail points to the location of the next read.
+Interestingly, this also covers the `splice` call, which has been a big focus for CVEs over the last year. I think this would be helpful if trying to inspect the contents of a pipe, but for our purposes - relating two processes as intending to communicate - it is likely not needed.
+
+**Q**: Why do both `pipe()` and `pipe2()` need to be monitored?
+
+**A**: Functionally, they are nearly identical except one modifies the attributes of the pipe or its file descriptors. Newer versions of the kernel may use `pipe2()` instead of the original `pipe()` function. TBD which one shell operations use.
+
+**Q**: When would `CLONE_FILES` be used in a normal operation?
+
+**A**: 
+
+**Q**: How is `close_range()` intended to be used, and how is it related to pipes?
+
+**A**: 
+
+---
+
 ## Current milestone
 
 The prototype reports summaries for successful `pipe()` and `pipe2()` calls
