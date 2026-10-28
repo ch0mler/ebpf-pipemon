@@ -59,15 +59,17 @@ Interestingly, this also covers the `splice` call, which has been a big focus fo
 
 **Q**: Why do both `pipe()` and `pipe2()` need to be monitored?
 
-**A**: Functionally, they are nearly identical except one modifies the attributes of the pipe or its file descriptors. Newer versions of the kernel may use `pipe2()` instead of the original `pipe()` function. TBD which one shell operations use.
+**A**: Functionally, they are nearly identical except one modifies the attributes of the pipe or its file descriptors. Newer versions of the kernel may use `pipe2()` instead of the original `pipe()` function. Once the pipes have been set up by the parent, they are assigned (`dup2`) in the child process ([src](https://github.com/gitGNU/gnu_bash/blob/bc007799f0e1362100375bb95d952d28de4c62fb/execute_cmd.c#L5681)).
 
 **Q**: When would `CLONE_FILES` be used in a normal operation?
 
-**A**: 
+**A**: When a process calls `clone()`, the process's file descriptor table is copied to the child context according to [the man page](https://www.man7.org/linux/man-pages/man2/clone.2.html). This is a unique variation to enable access to an existing pipe. Based on some cursory looking on GitHub, this is mostly seen in experimental kernels.
+
+Pretty much [all shell documentation](https://www.man7.org/tlpi/download/TLPI-24-Process_Creation.pdf) mentions forking instead of cloning to generate subprocesses (see [TLDP](https://tldp.org/LDP/abs/html/subshells.html)), and home projects where shells are rewritten also use `fork()` instead of `clone()` ([example](https://linuxvox.com/blog/almost-perfect-c-shell-piping/)). While I haven't seen an exact line where fork is used instead of clone with this flag set, I think this project will be safe to only monitor `pipe()` and `pipe2()`.
 
 **Q**: How is `close_range()` intended to be used, and how is it related to pipes?
 
-**A**: 
+**A**: This function is used to close file descriptors in an integer range ([src](https://man7.org/linux/man-pages/man2/close_range.2.html)), so it could be used to close several process pipes, but it doesn't appear helpful for identifying open pipes. The example in the man page explicitly starts at fd=3, past the STDERR descriptor.
 
 ---
 

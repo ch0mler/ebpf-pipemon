@@ -291,7 +291,7 @@ static bool process_has_pipe_on_standard_fd(const struct tracked_process *proces
                                             __u64 pipe_id,
                                             const struct tracked_connection *connection)
 {
-    const int standard_fds[] = {STDIN_FILENO, STDOUT_FILENO};
+    const int standard_fds[] = {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO};
     for (size_t i = 0; i < sizeof(standard_fds) / sizeof(standard_fds[0]); i++) {
         struct tracked_fd *entry = find_fd(process->pid, standard_fds[i]);
         if (entry && entry->pipe_id == pipe_id &&
@@ -484,7 +484,7 @@ static int flush_pipe_summaries(bool all)
 
 static int report_standard_fds(__u32 pid, const char *comm)
 {
-    const int standard_fds[] = {STDIN_FILENO, STDOUT_FILENO};
+    const int standard_fds[] = {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO};
     for (size_t i = 0; i < sizeof(standard_fds) / sizeof(standard_fds[0]); i++) {
         struct tracked_fd *entry = find_fd(pid, standard_fds[i]);
         if (entry && remember_connection(entry, pid, comm))
