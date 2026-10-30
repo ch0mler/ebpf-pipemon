@@ -144,18 +144,13 @@ static __always_inline int finish_call(long ret, __u32 expected_type)
     if (expected_type == PIPE_EVENT_FD_CLOSE)
         return emit_event(PIPE_EVENT_FD_CLOSE, (__s32)saved.arg1, -1, 0, 0, 0);
 
-    if (expected_type == PIPE_EVENT_CLOSE_RANGE)
-        return emit_event(PIPE_EVENT_CLOSE_RANGE, (__s32)saved.arg1,
-                          (__s32)saved.arg2, saved.flags,
-                          PIPE_CALL_CLOSE_RANGE, 0);
-
     if (expected_type == PIPE_EVENT_FORK && ret > 0) {
         /* Threads share an address space and are not separate process records here. */
         if ((saved.call == PIPE_CALL_CLONE ||
              saved.call == PIPE_CALL_CLONE3) &&
             (saved.flags & PIPEMON_CLONE_THREAD))
             return 0;
-        return emit_event(PIPE_EVENT_FORK, -1, -1, saved.flags, saved.call,
+        return emit_event(PIPE_EVENT_FORK, -1, -1, 0, saved.call,
                           (__u32)ret);
     }
 
@@ -254,19 +249,6 @@ int exit_close(struct syscall_exit_ctx *ctx)
     return finish_call(ctx->ret, PIPE_EVENT_FD_CLOSE);
 }
 
-SEC("tracepoint/syscalls/sys_enter_close_range")
-int enter_close_range(struct syscall_enter_ctx *ctx)
-{
-    return remember_call(ctx->args[0], ctx->args[1], (__u32)ctx->args[2],
-                         PIPE_CALL_CLOSE_RANGE);
-}
-
-SEC("tracepoint/syscalls/sys_exit_close_range")
-int exit_close_range(struct syscall_exit_ctx *ctx)
-{
-    return finish_call(ctx->ret, PIPE_EVENT_CLOSE_RANGE);
-}
-
 SEC("tracepoint/syscalls/sys_enter_fork")
 int enter_fork(struct syscall_enter_ctx *ctx)
 {
@@ -296,7 +278,8 @@ int exit_vfork(struct syscall_exit_ctx *ctx)
 SEC("tracepoint/syscalls/sys_enter_clone")
 int enter_clone(struct syscall_enter_ctx *ctx)
 {
-    return remember_call(0, 0, (__u32)ctx->args[0], PIPE_CALL_CLONE);
+    return remember_call(0, 0, (__u32)ctx->args[0] & PIPEMON_CLONE_THREAD,
+                         PIPE_CALL_CLONE);
 }
 
 SEC("tracepoint/syscalls/sys_exit_clone")
@@ -313,7 +296,8 @@ int enter_clone3(struct syscall_enter_ctx *ctx)
     if (bpf_probe_read_user(&clone_flags, sizeof(clone_flags),
                             (void *)ctx->args[0]))
         increment_stat(PIPE_STAT_CLONE_FLAGS_READ_FAILURES);
-    return remember_call(0, 0, (__u32)clone_flags, PIPE_CALL_CLONE3);
+    return remember_call(0, 0, (__u32)clone_flags & PIPEMON_CLONE_THREAD,
+                         PIPE_CALL_CLONE3);
 }
 
 SEC("tracepoint/syscalls/sys_exit_clone3")

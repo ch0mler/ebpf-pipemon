@@ -38,11 +38,9 @@ Tracked operations include:
 
 - `pipe()` and `pipe2()` creation
 - `dup()`, `dup2()`, `dup3()`, and `fcntl(F_DUPFD*)`
-- `close()` and `close_range()` when its tracepoints are available
+- `close()`
 - `fork()`, `vfork()`, `clone()`, and `clone3()`
 - `execve()`, `execveat()`, and process exit
-- Shared descriptor tables through `CLONE_FILES`, plus descriptor-table
-  unsharing behavior at exec and `close_range(UNSHARE)`
 
 The helper reads executable path, command line, UID, and parent PID from
 `/proc`. For short-lived processes, exited processes, or restricted procfs
@@ -67,10 +65,13 @@ for the pipe remain, or at shutdown if descriptors are still tracked. An
 example:
 
 ```text
-pipe_summary pipe_id=42 creator_pid=4100 creator_comm="bash" creator_exe="/usr/bin/bash" creator_cmdline="bash -c curl | bash" parent_pid=4000 parent_comm="sh" parent_exe="/usr/bin/sh" parent_cmdline="sh -c ..." connections=2
-pipe_connection pipe_id=42 side=writer pid=4101 comm="curl" exe="/usr/bin/curl" cmdline="curl https://example[.]invalid/script"
-pipe_connection pipe_id=42 side=reader pid=4102 comm="bash" exe="/usr/bin/bash" cmdline="bash"
+event=pipe_summary pipe_id=42 creator_pid=4100 creator_syscall=pipe2 creator_flags=0x00080000 creator_comm="bash" creator_exe="/usr/bin/bash" creator_cmdline="bash -c curl | bash" parent_pid=4000 parent_comm="sh" parent_exe="/usr/bin/sh" parent_cmdline="sh -c ..." connections=2
+event=pipe_connection pipe_id=42 side=writer pid=4101 comm="curl" exe="/usr/bin/curl" cmdline="curl https://example[.]invalid/script"
+event=pipe_connection pipe_id=42 side=reader pid=4102 comm="bash" exe="/usr/bin/bash" cmdline="bash"
 ```
+
+`creator_flags` is the hexadecimal flag mask passed to `pipe2()`; it is
+`0x00000000` for `pipe()`, which has no flags argument.
 
 Processes are reported as readers when the tracked pipe read end is observed
 on stdin and writers when the tracked write end is observed on stdout.
@@ -99,8 +100,7 @@ sudo ./pipe-monitor --output pipes.log
 
 The documented runtime target is x86_64 Linux 5.8 or newer. Linux 5.8 is the
 minimum because the implementation uses ring-buffer maps. The code does not
-require target-kernel BTF. `close_range()` tracking is optional and enabled
-when its tracepoints are present (Linux 5.9+).
+require target-kernel BTF.
 
 The README and
 [VM validation skill](./.github/skills/linux-ebpf-vm-validation/SKILL.md)
@@ -119,7 +119,9 @@ document prerequisites and the disposable QEMU/KVM test workflow.
 - The summary-output validation exited successfully. Its output contained
   `pipe_summary` / `pipe_connection` records without raw FD or stage fields;
   a check confirmed that the Bash-to-`cat` pipe had one writer and one reader.
-- Earlier VM runs also exercised `close_range()` and shared descriptor tables.
+- `close_range()` and shared descriptor-table tracking via `CLONE_FILES` have
+  been removed. The current helper does not attach to `close_range` tracepoints
+  and models clone-like children as independent descriptor-table copies.
 - VM tests used the bundled validation script, a copy-on-write guest overlay,
   and guest-side root privileges. Runtime behavior has not been checked on
   the development host or on Linux 5.8.
@@ -129,6 +131,9 @@ document prerequisites and the disposable QEMU/KVM test workflow.
 - Only anonymous `pipe()` / `pipe2()` pipes are handled. Unix-domain
   `SCM_RIGHTS`, named FIFOs, and descriptor state created before the monitor
   starts are not tracked.
+- `close_range()` is not monitored, and `CLONE_FILES` shared descriptor-table
+  changes are not tracked; clone-like children are modeled with copied
+  descriptor state.
 - Endpoint identification is based on stdin/stdout wiring, not actual data
   transfer. Other file-descriptor arrangements may be tracked internally but
   are not reported as reader/writer connections.
@@ -147,7 +152,8 @@ document prerequisites and the disposable QEMU/KVM test workflow.
 The project began with the staged goal of detecting pipe creation, identifying
 the creator, finding processes connected to both ends, and correlating the
 events in user space. The implementation grew to cover descriptor duplication,
-fork/clone inheritance, shared FD tables, exec, and process metadata. A
+fork/clone inheritance, shared FD tables, exec, and process metadata; shared
+FD-table support was later removed. A
 temporary heuristic filter for process names containing `sh` and its `--all`
 override were later removed at the user's request because process-name
 filtering was inaccurate. The output then evolved from verbose event lines to

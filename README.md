@@ -9,7 +9,7 @@ Since this helper has been 100% vibe coded so far, I'm still understanding some 
 
 ### Additional hooks
 
-I initially thought only `pipe()` would be appropriate to monitor, but `pipe2()`, `CLONE_FILES`, and `close_range()` were also chosen for inspection. Under what scenarios are each of these techniques used in setting up pipes, and why would each technique be used over each other?
+The helper monitors `pipe()` and `pipe2()` creation and common descriptor operations used to follow pipes into processes.
 
 #### pipe
 
@@ -46,10 +46,6 @@ If flags is 0, then pipe2() is the same as pipe().
 * O_NOTIFICATION_PIPE: (5.8+) kernel notifications added to pipes
 ```
 
-#### CLONE_FILES
-
-#### close_range()
-
 ## Open Questions
 
 **Q**: If pipes aren't on the filesystem, where are they?
@@ -59,17 +55,7 @@ Interestingly, this also covers the `splice` call, which has been a big focus fo
 
 **Q**: Why do both `pipe()` and `pipe2()` need to be monitored?
 
-**A**: Functionally, they are nearly identical except one modifies the attributes of the pipe or its file descriptors. Newer versions of the kernel may use `pipe2()` instead of the original `pipe()` function. Once the pipes have been set up by the parent, they are assigned (`dup2`) in the child process ([src](https://github.com/gitGNU/gnu_bash/blob/bc007799f0e1362100375bb95d952d28de4c62fb/execute_cmd.c#L5681)).
-
-**Q**: When would `CLONE_FILES` be used in a normal operation?
-
-**A**: When a process calls `clone()`, the process's file descriptor table is copied to the child context according to [the man page](https://www.man7.org/linux/man-pages/man2/clone.2.html). This is a unique variation to enable access to an existing pipe. Based on some cursory looking on GitHub, this is mostly seen in experimental kernels.
-
-Pretty much [all shell documentation](https://www.man7.org/tlpi/download/TLPI-24-Process_Creation.pdf) mentions forking instead of cloning to generate subprocesses (see [TLDP](https://tldp.org/LDP/abs/html/subshells.html)), and home projects where shells are rewritten also use `fork()` instead of `clone()` ([example](https://linuxvox.com/blog/almost-perfect-c-shell-piping/)). While I haven't seen an exact line where fork is used instead of clone with this flag set, I think this project will be safe to only monitor `pipe()` and `pipe2()`.
-
-**Q**: How is `close_range()` intended to be used, and how is it related to pipes?
-
-**A**: This function is used to close file descriptors in an integer range ([src](https://man7.org/linux/man-pages/man2/close_range.2.html)), so it could be used to close several process pipes, but it doesn't appear helpful for identifying open pipes. The example in the man page explicitly starts at fd=3, past the STDERR descriptor.
+**A**: Functionally, they are nearly identical except one modifies the attributes of the pipe or its file descriptors. Newer applications may use `pipe2()` instead of the original `pipe()` function. Once the pipes have been set up by the parent, they are assigned (`dup2`) in the child process ([src](https://github.com/gitGNU/gnu_bash/blob/bc007799f0e1362100375bb95d952d28de4c62fb/execute_cmd.c#L5681)). With a newer QEMU image (`Ubuntu 26.04.1 LTS`), it looks like pipe2 is actually used much more commonly.
 
 ---
 
@@ -77,11 +63,11 @@ Pretty much [all shell documentation](https://www.man7.org/tlpi/download/TLPI-24
 
 The prototype reports summaries for successful `pipe()` and `pipe2()` calls
 and tracks the resulting descriptors through fork-like process creation,
-shared descriptor tables (`CLONE_FILES`), common descriptor-duplication calls,
-and `close_range()`. It records a process when a tracked pipe end is connected
-to stdin or stdout, and uses process-exec events to identify the program that
-inherits those standard descriptors. This allows it to identify the programs
-at the two ends of common shell pipelines such as `curl ... | bash`.
+and common descriptor-duplication calls. It records a process when a tracked
+pipe end is connected to stdin or stdout, and uses process-exec events to
+identify the program that inherits those standard descriptors. This allows it
+to identify the programs at the two ends of common shell pipelines such as
+`curl ... | bash`.
 
 It does not observe actual reads or writes, so a reported endpoint means a
 process has the pipe end connected to stdin/stdout, not that it transferred
@@ -129,10 +115,13 @@ tracked descriptors for its pipe are closed, or when the monitor exits,
 whichever comes first. For example:
 
 ```text
-pipe_summary pipe_id=1 creator_pid=4100 creator_comm="bash" creator_exe="/usr/bin/bash" creator_cmdline="bash -c curl | bash" parent_pid=4000 parent_comm="sh" parent_exe="/usr/bin/sh" parent_cmdline="sh -c ..." connections=2
-pipe_connection pipe_id=1 side=writer pid=4101 comm="curl" exe="/usr/bin/curl" cmdline="curl https://example.invalid/script"
-pipe_connection pipe_id=1 side=reader pid=4102 comm="bash" exe="/usr/bin/bash" cmdline="bash"
+event=pipe_summary pipe_id=1 creator_pid=4100 creator_syscall=pipe2 creator_flags=0x00080000 creator_comm="bash" creator_exe="/usr/bin/bash" creator_cmdline="bash -c curl | bash" parent_pid=4000 parent_comm="sh" parent_exe="/usr/bin/sh" parent_cmdline="sh -c ..." connections=2
+event=pipe_connection pipe_id=1 side=writer pid=4101 comm="curl" exe="/usr/bin/curl" cmdline="curl https://example.invalid/script"
+event=pipe_connection pipe_id=1 side=reader pid=4102 comm="bash" exe="/usr/bin/bash" cmdline="bash"
 ```
+
+`creator_flags` is the hexadecimal flag mask passed to `pipe2()`; it is
+`0x00000000` for `pipe()`, which has no flags argument.
 
 Connections describe a pipe end connected to stdin (`reader`) or stdout
 (`writer`), not proof that data was transferred. A pipe still open when the
@@ -150,9 +139,7 @@ failures to standard error when it exits.
   `dup3`, `fcntl`, `close`, `fork`, `vfork`, `clone`, `clone3`, `execve`,
   `execveat`, `exit`, and `exit_group`; BPF tracepoint programs; hash and
   per-CPU array maps; and BPF ring buffers. Linux 5.8 is the minimum because
-  the implementation uses ring-buffer maps. The `close_range` syscall is
-  supported when its tracepoints exist (Linux 5.9+); otherwise those optional
-  probes are disabled with a startup warning.
+  the implementation uses ring-buffer maps.
 - **BTF:** target-kernel BTF is not currently required. This prototype reads
   only the syscall tracepoint context layout and does not access kernel-internal
   types or use CO-RE relocations.
@@ -164,15 +151,18 @@ failures to standard error when it exits.
   Events may be lost if the pending map fills, the user-memory read fails, or
   the ring buffer is full; these cases are counted and printed at shutdown.
   Userspace correlates the events by process ID and process-local descriptor.
-- **Known limitations:** `close_range()` and `CLONE_FILES` are tracked; their
-  behavior has been exercised in the disposable VM. Unusual descriptor-passing
-  mechanisms such as Unix-domain `SCM_RIGHTS`, namespace-specific PID
-  interpretation, and descriptor activity before the monitor starts are not
-  handled. Fork events are correlated from successful fork/clone syscall
-  exits; highly concurrent workloads can race event consumption and child
-  descriptor operations. The helper observes fork/clone, exec, and exit
-  syscall events system-wide to correlate process state. No process-name or
-  process-type filter is applied.
+- **Known limitations:** `close_range()` is not monitored, so closing tracked
+  descriptors with it can leave stale entries until the process exits.
+  `CLONE_FILES` is not tracked; clone-like children that share a descriptor
+  table are modeled as having a copied table, so subsequent shared descriptor
+  changes can make correlation incomplete or inaccurate. Unusual
+  descriptor-passing mechanisms such as Unix-domain `SCM_RIGHTS`,
+  namespace-specific PID interpretation, and descriptor activity before the
+  monitor starts are also not handled. Fork events are correlated from
+  successful fork/clone syscall exits; highly concurrent workloads can race
+  event consumption and child descriptor operations. The helper observes
+  fork/clone, exec, and exit syscall events system-wide to correlate process
+  state. No process-name or process-type filter is applied.
 
 ## Build host
 

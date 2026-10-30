@@ -17,10 +17,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#define PIPEMON_CLOSE_RANGE_UNSHARE 0x00000002
-#define PIPEMON_CLOSE_RANGE_CLOEXEC 0x00000004
-#define PIPEMON_CLONE_FILES 0x00000400
-
 struct proc_metadata {
     char comm[PIPEMON_COMM_LEN];
     char exe[PATH_MAX];
@@ -29,9 +25,9 @@ struct proc_metadata {
     int ppid;
 };
 
-/* Descriptor state is keyed by an emulated fd table, not just by process ID. */
+/* Descriptor state is tracked per process and descriptor. */
 struct tracked_fd {
-    __u64 fd_space;
+    __u32 pid;
     int fd;
     __u64 pipe_id;
     bool is_read_end;
@@ -42,7 +38,6 @@ struct tracked_fd {
 struct tracked_process {
     __u32 pid;
     __u64 instance_id;
-    __u64 fd_space;
     bool exec_seen;
     char comm[PIPEMON_COMM_LEN];
     struct proc_metadata metadata;
@@ -61,6 +56,8 @@ struct tracked_connection {
 struct tracked_pipe {
     __u64 pipe_id;
     __u32 creator_pid;
+    __u32 creator_call;
+    __u32 creator_flags;
     struct proc_metadata creator;
     struct proc_metadata parent;
     size_t connection_count;
@@ -73,7 +70,6 @@ static struct tracked_fd *tracked_fds;
 static struct tracked_process *tracked_processes;
 static struct tracked_pipe *tracked_pipes;
 static __u64 next_pipe_id = 1;
-static __u64 next_fd_space = 1;
 static __u64 next_process_instance = 1;
 static FILE *event_output;
 
@@ -106,33 +102,25 @@ static struct tracked_process *get_process(__u32 pid)
     process->instance_id = next_process_instance++;
     process->metadata.uid = -1;
     process->metadata.ppid = -1;
-    /* A new process starts with its own fd table unless a clone event says otherwise. */
-    process->fd_space = next_fd_space++;
     process->next = tracked_processes;
     tracked_processes = process;
     return process;
 }
 
-static struct tracked_fd *find_fd_in_space(__u64 fd_space, int fd)
+static struct tracked_fd *find_fd(__u32 pid, int fd)
 {
     for (struct tracked_fd *entry = tracked_fds; entry; entry = entry->next) {
-        if (entry->fd_space == fd_space && entry->fd == fd)
+        if (entry->pid == pid && entry->fd == fd)
             return entry;
     }
     return NULL;
 }
 
-static struct tracked_fd *find_fd(__u32 pid, int fd)
-{
-    struct tracked_process *process = get_process(pid);
-    return process ? find_fd_in_space(process->fd_space, fd) : NULL;
-}
-
-static void remove_fd_from_space(__u64 fd_space, int fd)
+static void remove_fd(__u32 pid, int fd)
 {
     struct tracked_fd **entry = &tracked_fds;
     while (*entry) {
-        if ((*entry)->fd_space == fd_space && (*entry)->fd == fd) {
+        if ((*entry)->pid == pid && (*entry)->fd == fd) {
             struct tracked_fd *removed = *entry;
             *entry = removed->next;
             free(removed);
@@ -142,22 +130,15 @@ static void remove_fd_from_space(__u64 fd_space, int fd)
     }
 }
 
-static void remove_fd(__u32 pid, int fd)
+static int set_fd(__u32 pid, int fd, __u64 pipe_id, bool is_read_end,
+                  bool close_on_exec)
 {
-    struct tracked_process *process = get_process(pid);
-    if (process)
-        remove_fd_from_space(process->fd_space, fd);
-}
-
-static int set_fd_in_space(__u64 fd_space, int fd, __u64 pipe_id,
-                           bool is_read_end, bool close_on_exec)
-{
-    struct tracked_fd *entry = find_fd_in_space(fd_space, fd);
+    struct tracked_fd *entry = find_fd(pid, fd);
     if (!entry) {
         entry = calloc(1, sizeof(*entry));
         if (!entry)
             return -1;
-        entry->fd_space = fd_space;
+        entry->pid = pid;
         entry->fd = fd;
         entry->next = tracked_fds;
         tracked_fds = entry;
@@ -167,14 +148,6 @@ static int set_fd_in_space(__u64 fd_space, int fd, __u64 pipe_id,
     entry->is_read_end = is_read_end;
     entry->close_on_exec = close_on_exec;
     return 0;
-}
-
-static int set_fd(__u32 pid, int fd, __u64 pipe_id, bool is_read_end,
-                  bool close_on_exec)
-{
-    struct tracked_process *process = get_process(pid);
-    return process ? set_fd_in_space(process->fd_space, fd, pipe_id,
-                                     is_read_end, close_on_exec) : -1;
 }
 
 static void print_escaped(const char *value)
@@ -310,7 +283,21 @@ static struct tracked_pipe *find_pipe(__u64 pipe_id)
     return NULL;
 }
 
+static const char *pipe_syscall_name(__u32 call)
+{
+    switch (call) {
+    case PIPE_CALL_PIPE:
+        return "pipe";
+    case PIPE_CALL_PIPE2:
+        return "pipe2";
+    default:
+        return "unknown";
+    }
+}
+
 static struct tracked_pipe *create_pipe_summary(__u64 pipe_id, __u32 creator_pid,
+                                                __u32 creator_call,
+                                                __u32 creator_flags,
                                                 const char *creator_comm)
 {
     struct tracked_pipe *pipe = calloc(1, sizeof(*pipe));
@@ -319,6 +306,8 @@ static struct tracked_pipe *create_pipe_summary(__u64 pipe_id, __u32 creator_pid
 
     pipe->pipe_id = pipe_id;
     pipe->creator_pid = creator_pid;
+    pipe->creator_call = creator_call;
+    pipe->creator_flags = creator_flags;
     pipe->creator.uid = -1;
     pipe->creator.ppid = -1;
     pipe->parent.uid = -1;
@@ -416,8 +405,11 @@ static void update_connections_after_exec(struct tracked_process *process,
 
 static int print_pipe_summary(const struct tracked_pipe *pipe)
 {
-    fprintf(event_output, "pipe_summary pipe_id=%llu creator_pid=%u",
+    fprintf(event_output, "event=pipe_summary pipe_id=%llu creator_pid=%u",
             (unsigned long long)pipe->pipe_id, pipe->creator_pid);
+    fprintf(event_output, " creator_syscall=%s",
+            pipe_syscall_name(pipe->creator_call));
+    fprintf(event_output, " creator_flags=0x%08x", pipe->creator_flags);
     fprintf(event_output, " creator_comm=");
     print_metadata_value(pipe->creator.comm);
     fprintf(event_output, " creator_exe=");
@@ -434,7 +426,7 @@ static int print_pipe_summary(const struct tracked_pipe *pipe)
 
     for (const struct tracked_connection *connection = pipe->connections;
          connection; connection = connection->next) {
-        fprintf(event_output, "pipe_connection pipe_id=%llu side=%s pid=%u comm=",
+        fprintf(event_output, "event=pipe_connection pipe_id=%llu side=%s pid=%u comm=",
                 (unsigned long long)pipe->pipe_id,
                 connection->is_read_end ? "reader" : "writer",
                 connection->pid);
@@ -493,31 +485,10 @@ static int report_standard_fds(__u32 pid, const char *comm)
     return 0;
 }
 
-static int report_fd_space_endpoints(__u64 fd_space)
+static int report_process_endpoints(struct tracked_process *process)
 {
-    /* CLONE_FILES makes one descriptor update visible to every member process. */
-    for (struct tracked_process *process = tracked_processes; process;
-         process = process->next) {
-        if (process->fd_space == fd_space &&
-            report_standard_fds(process->pid,
-                                process->comm[0] ? process->comm : NULL))
-            return -1;
-    }
-    return 0;
-}
-
-static void remove_fd_space(__u64 fd_space)
-{
-    struct tracked_fd **entry = &tracked_fds;
-    while (*entry) {
-        if ((*entry)->fd_space == fd_space) {
-            struct tracked_fd *removed = *entry;
-            *entry = removed->next;
-            free(removed);
-        } else {
-            entry = &(*entry)->next;
-        }
-    }
+    return report_standard_fds(process->pid,
+                               process->comm[0] ? process->comm : NULL);
 }
 
 static void remove_process(__u32 pid)
@@ -527,31 +498,29 @@ static void remove_process(__u32 pid)
         if ((*process)->pid == pid) {
             struct tracked_process *removed = *process;
             *process = removed->next;
-            __u64 fd_space = removed->fd_space;
             free(removed);
-            bool still_referenced = false;
-            for (struct tracked_process *other = tracked_processes; other;
-                 other = other->next) {
-                if (other->fd_space == fd_space) {
-                    still_referenced = true;
-                    break;
+            struct tracked_fd **entry = &tracked_fds;
+            while (*entry) {
+                if ((*entry)->pid == pid) {
+                    struct tracked_fd *removed_fd = *entry;
+                    *entry = removed_fd->next;
+                    free(removed_fd);
+                } else {
+                    entry = &(*entry)->next;
                 }
             }
-            if (!still_referenced)
-                /* Keep shared descriptor entries until their last process exits. */
-                remove_fd_space(fd_space);
             return;
         }
         process = &(*process)->next;
     }
 }
 
-static int copy_fd_space(__u64 source_space, __u64 target_space)
+static int copy_fds(__u32 source_pid, __u32 target_pid)
 {
     /* Copy through a temporary list so allocation failure leaves target intact. */
     struct tracked_fd *copies = NULL;
     for (struct tracked_fd *entry = tracked_fds; entry; entry = entry->next) {
-        if (entry->fd_space != source_space)
+        if (entry->pid != source_pid)
             continue;
 
         struct tracked_fd *copy = malloc(sizeof(*copy));
@@ -564,7 +533,7 @@ static int copy_fd_space(__u64 source_space, __u64 target_space)
             return -1;
         }
         *copy = *entry;
-        copy->fd_space = target_space;
+        copy->pid = target_pid;
         copy->next = copies;
         copies = copy;
     }
@@ -578,31 +547,7 @@ static int copy_fd_space(__u64 source_space, __u64 target_space)
     return 0;
 }
 
-static size_t fd_space_references(__u64 fd_space)
-{
-    size_t references = 0;
-    for (struct tracked_process *process = tracked_processes; process;
-         process = process->next) {
-        if (process->fd_space == fd_space)
-            references++;
-    }
-    return references;
-}
-
-static int unshare_fd_space(struct tracked_process *process)
-{
-    if (fd_space_references(process->fd_space) < 2)
-        return 0;
-
-    __u64 new_space = next_fd_space++;
-    /* exec and close_range(UNSHARE) split only this process from shared state. */
-    if (copy_fd_space(process->fd_space, new_space))
-        return -1;
-    process->fd_space = new_space;
-    return 0;
-}
-
-static int inherit_fds(__u32 parent_pid, __u32 child_pid, __u32 flags)
+static int inherit_fds(__u32 parent_pid, __u32 child_pid)
 {
     struct tracked_process *parent = get_process(parent_pid);
     struct tracked_process *child = get_process(child_pid);
@@ -613,46 +558,7 @@ static int inherit_fds(__u32 parent_pid, __u32 child_pid, __u32 flags)
     child->metadata = parent->metadata;
     child->metadata.ppid = (int)parent_pid;
 
-    /* CLONE_FILES shares mutations; ordinary fork/clone gets an independent copy. */
-    if (flags & PIPEMON_CLONE_FILES) {
-        child->fd_space = parent->fd_space;
-        return 0;
-    }
-
-    return copy_fd_space(parent->fd_space, child->fd_space);
-}
-
-static int apply_close_range(__u32 pid, __u32 first, __u32 last, __u32 flags)
-{
-    struct tracked_process *process = get_process(pid);
-    if (!process)
-        return -1;
-
-    /* UNSHARE changes this task's fd table before applying the requested range. */
-    if ((flags & PIPEMON_CLOSE_RANGE_UNSHARE) &&
-        unshare_fd_space(process))
-        return -1;
-
-    struct tracked_fd **entry = &tracked_fds;
-    while (*entry) {
-        struct tracked_fd *current = *entry;
-        __u32 fd = (unsigned int)current->fd;
-        if (current->fd_space != process->fd_space ||
-            fd < first || fd > last) {
-            entry = &current->next;
-            continue;
-        }
-
-        if (flags & PIPEMON_CLOSE_RANGE_CLOEXEC) {
-            /* CLOSE_RANGE_CLOEXEC defers dropping these descriptors until exec. */
-            current->close_on_exec = true;
-            entry = &current->next;
-        } else {
-            *entry = current->next;
-            free(current);
-        }
-    }
-    return 0;
+    return copy_fds(parent_pid, child_pid);
 }
 
 static int handle_event(void *ctx, void *data, size_t data_size)
@@ -691,7 +597,8 @@ static int handle_event(void *ctx, void *data, size_t data_size)
     case PIPE_EVENT_CREATED: {
         /* IDs are local to this monitor run; track both returned pipe ends. */
         __u64 pipe_id = next_pipe_id++;
-        if (!create_pipe_summary(pipe_id, event->pid, comm)) {
+        if (!create_pipe_summary(pipe_id, event->pid, event->call,
+                                 event->flags, comm)) {
             fprintf(stderr, "Could not allocate summary for pipe %llu\n",
                     (unsigned long long)pipe_id);
             return -ENOMEM;
@@ -706,14 +613,14 @@ static int handle_event(void *ctx, void *data, size_t data_size)
             return -ENOMEM;
         }
         struct tracked_process *process = find_process(event->pid);
-        if (report_fd_space_endpoints(process->fd_space)) {
+        if (report_process_endpoints(process)) {
             fprintf(stderr, "Could not record pipe endpoint connections\n");
             return -ENOMEM;
         }
         break;
     }
     case PIPE_EVENT_FORK:
-        if (inherit_fds(event->pid, event->child_pid, event->flags)) {
+        if (inherit_fds(event->pid, event->child_pid)) {
             fprintf(stderr, "Could not inherit tracked descriptors from pid %u "
                     "to pid %u\n", event->pid, event->child_pid);
             return -ENOMEM;
@@ -738,7 +645,7 @@ static int handle_event(void *ctx, void *data, size_t data_size)
         }
         if (event->fd2 == STDIN_FILENO || event->fd2 == STDOUT_FILENO) {
             struct tracked_process *process = find_process(event->pid);
-            if (report_fd_space_endpoints(process->fd_space)) {
+            if (report_process_endpoints(process)) {
                 fprintf(stderr, "Could not record pipe endpoint connections\n");
                 return -ENOMEM;
             }
@@ -748,29 +655,16 @@ static int handle_event(void *ctx, void *data, size_t data_size)
     case PIPE_EVENT_FD_CLOSE:
         remove_fd(event->pid, event->fd);
         break;
-    case PIPE_EVENT_CLOSE_RANGE:
-        if (apply_close_range(event->pid, (unsigned int)event->fd,
-                              (unsigned int)event->fd2, event->flags)) {
-            fprintf(stderr, "Could not apply close_range for pid %u\n",
-                    event->pid);
-            return -ENOMEM;
-        }
-        break;
     case PIPE_EVENT_EXEC: {
         struct tracked_process *process = get_process(event->pid);
         if (!process) {
             fprintf(stderr, "Could not track exec state for pid %u\n", event->pid);
             return -ENOMEM;
         }
-        if (unshare_fd_space(process)) {
-            fprintf(stderr, "Could not unshare descriptors at exec for pid %u\n",
-                    event->pid);
-            return -ENOMEM;
-        }
         /* exec closes CLOEXEC descriptors before the new image uses stdio. */
         struct tracked_fd **entry = &tracked_fds;
         while (*entry) {
-            if ((*entry)->fd_space == process->fd_space &&
+            if ((*entry)->pid == process->pid &&
                 (*entry)->close_on_exec) {
                 struct tracked_fd *removed = *entry;
                 *entry = removed->next;
@@ -905,25 +799,6 @@ static void free_state(void)
     }
 }
 
-static bool tracepoint_is_available(const char *name)
-{
-    static const char *tracefs_roots[] = {
-        "/sys/kernel/tracing/events/syscalls",
-        "/sys/kernel/debug/tracing/events/syscalls",
-    };
-    char path[PATH_MAX];
-
-    for (size_t i = 0;
-         i < sizeof(tracefs_roots) / sizeof(tracefs_roots[0]); i++) {
-        int length = snprintf(path, sizeof(path), "%s/%s/id",
-                              tracefs_roots[i], name);
-        if (length > 0 && (size_t)length < sizeof(path) &&
-            access(path, R_OK) == 0)
-            return true;
-    }
-    return false;
-}
-
 static void usage(const char *program)
 {
     fprintf(stderr, "Usage: %s [--output FILE] [--help]\n", program);
@@ -968,18 +843,6 @@ int main(int argc, char **argv)
     if (!skel) {
         fprintf(stderr, "Could not open BPF object: %s\n", strerror(errno));
         goto cleanup;
-    }
-
-    if (!tracepoint_is_available("sys_enter_close_range") ||
-        !tracepoint_is_available("sys_exit_close_range")) {
-        /* close_range was added after the base kernel target; disable only these probes. */
-        if (bpf_program__set_autoload(skel->progs.enter_close_range, false) ||
-            bpf_program__set_autoload(skel->progs.exit_close_range, false)) {
-            fprintf(stderr, "Could not disable unavailable close_range probes\n");
-            goto cleanup;
-        }
-        fprintf(stderr, "close_range syscall tracepoint unavailable; "
-                "close_range descriptor tracking disabled\n");
     }
 
     /* Skeleton owns the BPF object and links; destroy it on every exit path. */

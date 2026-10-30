@@ -12,9 +12,9 @@ enum pipe_event_type {
     PIPE_EVENT_FORK,
     PIPE_EVENT_FD_DUP,
     PIPE_EVENT_FD_CLOSE,
-    PIPE_EVENT_CLOSE_RANGE,
-    PIPE_EVENT_EXEC,
-    PIPE_EVENT_EXIT,
+    /* Event ID 5 is reserved for removed close_range tracking. */
+    PIPE_EVENT_EXEC = 6,
+    PIPE_EVENT_EXIT = 7,
 };
 
 /* Identifies the syscall that caused a creation, duplication, or fork event. */
@@ -30,7 +30,6 @@ enum pipe_call {
     PIPE_CALL_VFORK,
     PIPE_CALL_CLONE,
     PIPE_CALL_CLONE3,
-    PIPE_CALL_CLOSE_RANGE,
 };
 
 /* Per-CPU counters for failures that can otherwise make correlation incomplete. */
